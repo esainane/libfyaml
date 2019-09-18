@@ -164,6 +164,12 @@ enum fy_error_module {
 #define FYPCF_DEBUG_DIAG_SHIFT		16
 /* Mask of the debug diagnostric output options */
 #define FYPCF_DEBUG_DIAG_MASK		((1U << 4) - 1)
+/* Shift amount of the experimental tab indent option */
+#define FYPCF_TAB_SHIFT			24
+/* Mask of the experimental tab indent option */
+#define FYPCF_TAB_MASK			((1U << 4) - 1)
+/* Build a tab option (experimental) */
+#define FYPCF_TAB(x)			(((unsigned int)(x) & FYPCF_TAB_MASK) << FYPCF_TAB_SHIFT)
 
 /**
  * enum fy_parse_cfg_flags - Parse configuration flags
@@ -197,6 +203,8 @@ enum fy_error_module {
  * @FYPCF_DISABLE_MMAP_OPT: Disable mmap optimization
  * @FYPCF_DISABLE_RECYCLING: Disable recycling optimization
  * @FYPCF_PARSE_COMMENTS: Enable parsing of comments (experimental)
+ * @FYPCF_TAB_AUTO: Automatically use tab setting parsing comments (by default 8)
+ * @FYPCF_TAB_NONE: Disable tab for indent purposes completely
  */
 enum fy_parse_cfg_flags {
 	FYPCF_QUIET			= FY_BIT(0),
@@ -225,6 +233,8 @@ enum fy_parse_cfg_flags {
 	FYPCF_DISABLE_MMAP_OPT		= FY_BIT(21),
 	FYPCF_DISABLE_RECYCLING		= FY_BIT(22),
 	FYPCF_PARSE_COMMENTS		= FY_BIT(23),
+	FYPCF_TAB_AUTO			= FYPCF_TAB(0),
+	FYPCF_TAB_NONE			= FYPCF_TAB(15),
 };
 
 /* Enable diagnostic output by all modules */

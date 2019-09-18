@@ -139,6 +139,7 @@ int fy_parse_get_next_input(struct fy_parser *fyp)
 	fyp->current_w = 0;
 	fyp->line = 0;
 	fyp->column = 0;
+	fyp->nontab_column = 0;
 
 	fy_scan_debug(fyp, "get next input: new input");
 
@@ -546,6 +547,16 @@ int fy_parse_setup(struct fy_parser *fyp, const struct fy_parse_cfg *cfg)
 
 	fyp->pending_complex_key_column = -1;
 	fyp->last_block_mapping_key_line = -1;
+
+	if ((fyp->cfg.flags & (FYPCF_TAB_MASK << FYPCF_TAB_SHIFT)) == FYPCF_TAB_AUTO)
+		fyp->tabsize = 0;	/* disable for now */
+	else if ((fyp->cfg.flags & (FYPCF_TAB_MASK << FYPCF_TAB_SHIFT)) == FYPCF_TAB_NONE)
+		fyp->tabsize = 0;	/* complete disable */
+	else
+		fyp->tabsize = (fyp->cfg.flags >> FYPCF_TAB_SHIFT) & FYPCF_TAB_MASK;
+
+	if (fyp->tabsize)
+		fy_notice(fyp, "TAB size set to %d", fyp->tabsize);
 
 	fyp->suppress_recycling = !!(fyp->cfg.flags & FYPCF_DISABLE_RECYCLING) ||
 		                  getenv("FY_VALGRIND");
@@ -1012,6 +1023,7 @@ struct fy_input *fy_parse_input_from_data(struct fy_parser *fyp,
 	handle->chomp = FYAC_STRIP;
 	handle->increment = 0;
 	handle->fyi = fyi;
+	handle->tabsize = fyp->tabsize;
 
 	fyi->state = FYIS_PARSED;
 	fyi->on_list = &fyp->parsed_inputs;
@@ -1372,6 +1384,7 @@ int fy_scan_comment(struct fy_parser *fyp, struct fy_atom *handle, bool single_l
 		handle->ends_with_lb = false;
 		handle->trailing_lb = false;
 		handle->size0 = lines > 0;
+		handle->tabsize = fyp->tabsize;
 	}
 
 	return 0;
@@ -1426,28 +1439,34 @@ int fy_scan_to_next_token(struct fy_parser *fyp)
 		if (fyp->column == 0 && c == FY_UTF8_BOM)
 			fy_advance(fyp, c);
 
-		/* scan ahead until the next non-ws character */
-		/* if it's a flow start one, then tabs are allowed */
-		tabs_allowed = fyp->flow_level || !fyp->simple_key_allowed;
-		if (!tabs_allowed && fy_is_ws(c = fy_parse_peek(fyp))) {
-			i = 0;
-			offset = -1;
-			while (fy_is_ws(c_after_ws = fy_parse_peek_at_internal(fyp, i, &offset)))
-				i++;
-			/* flow start marker after spaces? allow tabs */
-			if (c_after_ws == '{' || c_after_ws == '[')
-				tabs_allowed = true;
-		}
+		if (!fyp->tabsize) {
+			/* scan ahead until the next non-ws character */
+			/* if it's a flow start one, then tabs are allowed */
+			tabs_allowed = fyp->flow_level || !fyp->simple_key_allowed;
+			if (!tabs_allowed && fy_is_ws(c = fy_parse_peek(fyp))) {
+				i = 0;
+				offset = -1;
+				while (fy_is_ws(c_after_ws = fy_parse_peek_at_internal(fyp, i, &offset)))
+					i++;
+				/* flow start marker after spaces? allow tabs */
+				if (c_after_ws == '{' || c_after_ws == '[')
+					tabs_allowed = true;
+			}
 
-		/* skip white space, tabs are allowed in flow context */
-		/* tabs also allowed in block context but not at start of line or after -?: */
-		while ((c = fy_parse_peek(fyp)) == ' ' || (c == '\t' && tabs_allowed))
-			fy_advance(fyp, c);
+			/* skip white space, tabs are allowed in flow context */
+			/* tabs also allowed in block context but not at start of line or after -?: */
+			while ((c = fy_parse_peek(fyp)) == ' ' || (c == '\t' && tabs_allowed))
+				fy_advance(fyp, c);
 
-		if (c == '\t') {
-			fy_scan_debug(fyp, "tab as token start (flow_level=%d simple_key_allowed=%s)",
-					fyp->flow_level,
-					fyp->simple_key_allowed ? "true" : "false");
+			if (c == '\t') {
+				fy_scan_debug(fyp, "tab as token start (flow_level=%d simple_key_allowed=%s)",
+						fyp->flow_level,
+						fyp->simple_key_allowed ? "true" : "false");
+			}
+		} else {
+			/* skip white space including tabs */
+			while (fy_is_ws(c = fy_parse_peek(fyp)))
+				fy_advance(fyp, c);
 		}
 
 		/* comment? */
@@ -1745,8 +1764,8 @@ int fy_save_simple_key(struct fy_parser *fyp, struct fy_mark *mark, struct fy_ma
 
 	/* remove pending complex key mark if in non flow context and a new line */
 	if (!fyp->flow_level && fyp->pending_complex_key_column >= 0 &&
-	mark->line > fyp->pending_complex_key_mark.line &&
-	mark->column <= fyp->pending_complex_key_mark.column ) {
+	    mark->line > fyp->pending_complex_key_mark.line &&
+	    mark->column <= fyp->pending_complex_key_mark.column ) {
 
 		fy_scan_debug(fyp, "resetting pending_complex_key mark->line=%d line=%d\n",
 				mark->line, fyp->pending_complex_key_mark.line);
@@ -1908,6 +1927,7 @@ int fy_fetch_stream_end(struct fy_parser *fyp)
 	/* force new line */
 	if (fyp->column) {
 		fyp->column = 0;
+		fyp->nontab_column = 0;
 		fyp->line++;
 	}
 
@@ -3266,17 +3286,25 @@ int fy_scan_block_scalar_indent(struct fy_parser *fyp, int indent, int *breaks)
 	/* scan over the indentation spaces */
 	/* we don't format content for display */
 	for (;;) {
+
 		/* skip over indentation */
-		while ((c = fy_parse_peek(fyp)) == ' ' &&
-			(!indent || fyp->column < indent))
-			fy_advance(fyp, c);
+
+		if (!fyp->tabsize) {
+			while ((c = fy_parse_peek(fyp)) == ' ' &&
+				(!indent || fyp->column < indent))
+				fy_advance(fyp, c);
+
+			FY_ERROR_CHECK(fyp, NULL, &ec, FYEM_SCAN,
+					c != '\t' || !(!indent && fyp->column < indent),
+					err_invalid_tab_as_indentation);
+		} else {
+			while (fy_is_ws((c = fy_parse_peek(fyp))) &&
+				(!indent || fyp->column < indent))
+				fy_advance(fyp, c);
+		}
 
 		if (fyp->column > max_indent)
 			max_indent = fyp->column;
-
-		FY_ERROR_CHECK(fyp, NULL, &ec, FYEM_SCAN,
-				c != '\t' || !(!indent && fyp->column < indent),
-				err_invalid_tab_as_indentation);
 
 		/* non-empty line? */
 		if (!fy_is_break(c))
@@ -3627,6 +3655,7 @@ int fy_fetch_block_scalar(struct fy_parser *fyp, bool is_literal, int c)
 	handle.ends_with_lb = ends_with_lb;
 	handle.trailing_lb = trailing_lb;
 	handle.size0 = length == 0;
+	handle.tabsize = fyp->tabsize;
 
 #ifdef ATOM_SIZE_CHECK
 	tlength = fy_atom_format_text_length(&handle);
@@ -3933,6 +3962,7 @@ int fy_fetch_flow_scalar(struct fy_parser *fyp, int c)
 	handle.ends_with_lb = ends_with_lb;
 	handle.trailing_lb = trailing_lb;
 	handle.size0 = length == 0;
+	handle.tabsize = fyp->tabsize;
 
 	/* skip over block scalar end */
 	fy_advance_by(fyp, 1);
@@ -4180,11 +4210,12 @@ int fy_fetch_plain_scalar(struct fy_parser *fyp, int c)
 		do {
 			fy_advance(fyp, c);
 
-			/* check for tab */
-
-			FY_ERROR_CHECK(fyp, NULL, &ec, FYEM_SCAN,
-					c != '\t' || !has_leading_blanks || fyp->column >= indent,
-					err_invalid_tab_indentation);
+			if (!fyp->tabsize) {
+				/* check for tab */
+				FY_ERROR_CHECK(fyp, NULL, &ec, FYEM_SCAN,
+						c != '\t' || !has_leading_blanks || fyp->column >= indent,
+						err_invalid_tab_indentation);
+			}
 
 			nextc = fy_parse_peek(fyp);
 
@@ -4232,6 +4263,7 @@ int fy_fetch_plain_scalar(struct fy_parser *fyp, int c)
 	handle.ends_with_lb = false;
 	handle.trailing_lb = false;
 	handle.size0 = length == 0;
+	handle.tabsize = fyp->tabsize;
 
 #ifdef ATOM_SIZE_CHECK
 	tlength = fy_atom_format_text_length(&handle);
@@ -4400,6 +4432,7 @@ int fy_fetch_tokens(struct fy_parser *fyp)
 
 	if (c == '[' || c == '{') {
 
+		fy_scan_debug(fyp, "calling fy_fetch_flow_collection_mark_start(%c)", c);
 		rc = fy_fetch_flow_collection_mark_start(fyp, c);
 		fy_error_check(fyp, !rc, err_out_rc,
 				"fy_fetch_flow_collection_mark_start() failed");
@@ -4408,6 +4441,7 @@ int fy_fetch_tokens(struct fy_parser *fyp)
 
 	if (c == ']' || c == '}') {
 
+		fy_scan_debug(fyp, "fy_fetch_flow_collection_mark_end(%c)", c);
 		rc = fy_fetch_flow_collection_mark_end(fyp, c);
 		fy_error_check(fyp, !rc, err_out_rc,
 				"fy_fetch_flow_collection_mark_end() failed");
@@ -4417,6 +4451,7 @@ int fy_fetch_tokens(struct fy_parser *fyp)
 
 	if (c == ',') {
 
+		fy_scan_debug(fyp, "fy_fetch_flow_collection_entry(%c)", c);
 		rc = fy_fetch_flow_collection_entry(fyp, c);
 		fy_error_check(fyp, !rc, err_out_rc,
 				"fy_fetch_flow_collection_entry() failed");
@@ -4425,6 +4460,7 @@ int fy_fetch_tokens(struct fy_parser *fyp)
 
 	if (c == '-' && fy_is_blankz_at_offset(fyp, 1)) {
 
+		fy_scan_debug(fyp, "fy_fetch_block_entry(%c)", c);
 		rc = fy_fetch_block_entry(fyp, c);
 		fy_error_check(fyp, !rc, err_out_rc,
 				"fy_fetch_block_entry() failed");
@@ -4433,6 +4469,7 @@ int fy_fetch_tokens(struct fy_parser *fyp)
 
 	if (c == '?' && (fyp->flow_level || fy_is_blankz_at_offset(fyp, 1))) {
 
+		fy_scan_debug(fyp, "fy_fetch_key(%c)", c);
 		rc = fy_fetch_key(fyp, c);
 		fy_error_check(fyp, !rc, err_out_rc,
 				"fy_fetch_key() failed");
@@ -4441,6 +4478,7 @@ int fy_fetch_tokens(struct fy_parser *fyp)
 
 	if (c == ':' && ((fyp->flow_level && !fyp->simple_key_allowed) || fy_is_blankz_at_offset(fyp, 1))) {
 
+		fy_scan_debug(fyp, "fy_fetch_value(%c)", c);
 		rc = fy_fetch_value(fyp, c);
 		fy_error_check(fyp, !rc, err_out_rc,
 				"fy_fetch_value() failed");
@@ -4449,6 +4487,7 @@ int fy_fetch_tokens(struct fy_parser *fyp)
 
 	if (c == '*' || c == '&') {
 
+		fy_scan_debug(fyp, "fy_fetch_anchor_or_alias(%c)", c);
 		rc = fy_fetch_anchor_or_alias(fyp, c);
 		fy_error_check(fyp, !rc, err_out_rc,
 				"fy_fetch_anchor_or_alias() failed");
@@ -4457,6 +4496,7 @@ int fy_fetch_tokens(struct fy_parser *fyp)
 
 	if (c == '!') {
 
+		fy_scan_debug(fyp, "fy_fetch_tag(%c)", c);
 		rc = fy_fetch_tag(fyp, c);
 		fy_error_check(fyp, !rc, err_out_rc,
 				"fy_fetch_tag() failed");
@@ -4465,6 +4505,7 @@ int fy_fetch_tokens(struct fy_parser *fyp)
 
 	if (!fyp->flow_level && (c == '|' || c == '>')) {
 
+		fy_scan_debug(fyp, "fy_fetch_block_scalar(%c)", c);
 		rc = fy_fetch_block_scalar(fyp, c == '|', c);
 		fy_error_check(fyp, !rc, err_out_rc,
 				"fy_fetch_block_scalar() failed");
@@ -4473,12 +4514,14 @@ int fy_fetch_tokens(struct fy_parser *fyp)
 
 	if (c == '\'' || c == '"') {
 
+		fy_scan_debug(fyp, "fy_fetch_flow_scalar(%c)", c);
 		rc = fy_fetch_flow_scalar(fyp, c);
 		fy_error_check(fyp, !rc, err_out_rc,
 				"fy_fetch_flow_scalar() failed");
 		return 0;
 	}
 
+	fy_scan_debug(fyp, "fy_fetch_plain_scalar(%c)", c);
 	rc = fy_fetch_plain_scalar(fyp, c);
 	fy_error_check(fyp, !rc, err_out_rc,
 			"fy_fetch_plain_scalar() failed");
