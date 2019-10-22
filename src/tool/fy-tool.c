@@ -40,7 +40,7 @@
 #define STRIP_LABELS_DEFAULT		false
 #define STRIP_TAGS_DEFAULT		false
 #define STRIP_DOC_DEFAULT		false
-#define TAB_DEFAULT			"none"
+#define TAB_DEFAULT			"auto"
 
 #define OPT_DUMP			1000
 #define OPT_TESTSUITE			1001
